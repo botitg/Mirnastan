@@ -272,7 +272,7 @@ async def org_chat_view(callback: CallbackQuery, state: FSMContext):
     )
 
 
-@router.message(OrganizationStates.org_chat_message, F.text)
+@router.message(OrganizationStates.org_chat_message, F.text, ~F.text.startswith("/"))
 async def org_chat_send_finish(message: Message, state: FSMContext):
     """Сохранить сообщение в чат организации."""
     data = await state.get_data()
@@ -341,7 +341,7 @@ async def start_apply_to_organization(callback: CallbackQuery, state: FSMContext
     await callback.message.edit_text(text, reply_markup=get_back_button(callback="orgs_main"), parse_mode='Markdown')
 
 
-@router.message(OrganizationStates.application_text, F.text)
+@router.message(OrganizationStates.application_text, F.text, ~F.text.startswith("/"))
 async def receive_application_text(message: Message, state: FSMContext):
     """Получение текста заявки"""
     data = await state.get_data()

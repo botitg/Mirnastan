@@ -150,7 +150,7 @@ async def confirm_revolution_sponsorship(callback: CallbackQuery, state: FSMCont
     await callback.message.edit_text(text, reply_markup=get_back_button(callback="revolution_menu"), parse_mode='Markdown')
 
 
-@router.message(RevolutionStates.creating_manifesto, F.text)
+@router.message(RevolutionStates.creating_manifesto, F.text, ~F.text.startswith("/"))
 async def process_revolution_manifesto(message: Message, state: FSMContext):
     """Обработка манифеста революции"""
     data = await state.get_data()
@@ -614,3 +614,4 @@ async def revolution_history(callback: CallbackQuery, state: FSMContext):
     keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="revolution_menu")])
     await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
     await callback.answer()
+

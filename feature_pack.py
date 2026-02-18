@@ -209,7 +209,7 @@ async def feature_business_select_type(callback: CallbackQuery, state: FSMContex
     )
 
 
-@router.message(FeatureStates.business_name, F.text)
+@router.message(FeatureStates.business_name, F.text, ~F.text.startswith("/"))
 async def feature_business_name_input(message: Message, state: FSMContext):
     data = await state.get_data()
     property_id = int(data.get("fp_business_property_id") or 0)
@@ -471,7 +471,7 @@ async def feature_private_org_pick_property(callback: CallbackQuery, state: FSMC
     )
 
 
-@router.message(FeatureStates.private_org_name, F.text)
+@router.message(FeatureStates.private_org_name, F.text, ~F.text.startswith("/"))
 async def feature_private_org_name_input(message: Message, state: FSMContext):
     data = await state.get_data()
     prop_id = int(data.get("fp_private_org_property_id") or 0)
@@ -785,7 +785,7 @@ async def feature_casino_create_start(callback: CallbackQuery, state: FSMContext
     )
 
 
-@router.message(FeatureStates.private_casino_name, F.text)
+@router.message(FeatureStates.private_casino_name, F.text, ~F.text.startswith("/"))
 async def feature_casino_name_input(message: Message, state: FSMContext):
     success, msg, payload = await db.create_private_casino(
         owner_id=message.from_user.id,
@@ -1095,7 +1095,7 @@ async def feature_gang_create_start(callback: CallbackQuery, state: FSMContext):
     )
 
 
-@router.message(FeatureStates.gang_name, F.text)
+@router.message(FeatureStates.gang_name, F.text, ~F.text.startswith("/"))
 async def feature_gang_create_name(message: Message, state: FSMContext):
     success, msg, gang_id = await db.create_gang(message.from_user.id, message.text or "")
     await state.clear()
@@ -1137,7 +1137,7 @@ async def feature_cartel_create_start(callback: CallbackQuery, state: FSMContext
     )
 
 
-@router.message(FeatureStates.cartel_name, F.text)
+@router.message(FeatureStates.cartel_name, F.text, ~F.text.startswith("/"))
 async def feature_cartel_create_name(message: Message, state: FSMContext):
     data = await state.get_data()
     gid = int(data.get("cartel_gang_id") or 0)
@@ -1232,7 +1232,7 @@ async def feature_pres_law_add_start(callback: CallbackQuery, state: FSMContext)
     )
 
 
-@router.message(FeatureStates.law_create, F.text)
+@router.message(FeatureStates.law_create, F.text, ~F.text.startswith("/"))
 async def feature_pres_law_add_input(message: Message, state: FSMContext):
     if not await _ensure_president_message(message, state, "pres_laws"):
         return
@@ -1269,7 +1269,7 @@ async def feature_pres_law_edit_start(callback: CallbackQuery, state: FSMContext
     )
 
 
-@router.message(FeatureStates.law_edit, F.text)
+@router.message(FeatureStates.law_edit, F.text, ~F.text.startswith("/"))
 async def feature_pres_law_edit_input(message: Message, state: FSMContext):
     if not await _ensure_president_message(message, state, "pres_laws"):
         return
@@ -1348,7 +1348,7 @@ async def feature_pres_flag_set_text(callback: CallbackQuery, state: FSMContext)
     await callback.message.answer("Введите текст флага (эмодзи/девиз):", reply_markup=_back("pres_flag_menu", "🔙 Отмена"), parse_mode=None)
 
 
-@router.message(FeatureStates.flag_text, F.text)
+@router.message(FeatureStates.flag_text, F.text, ~F.text.startswith("/"))
 async def feature_pres_flag_text_input(message: Message, state: FSMContext):
     if not await _ensure_president_message(message, state, "pres_flag_menu"):
         return
@@ -1413,7 +1413,7 @@ async def feature_pres_tax_holiday_pick(callback: CallbackQuery, state: FSMConte
     )
 
 
-@router.message(FeatureStates.tax_holiday_reason, F.text)
+@router.message(FeatureStates.tax_holiday_reason, F.text, ~F.text.startswith("/"))
 async def feature_pres_tax_holiday_reason(message: Message, state: FSMContext):
     if not await _ensure_president_message(message, state, "pres_tax_holiday_menu"):
         return
@@ -1531,7 +1531,7 @@ async def feature_contracts_create_start(callback: CallbackQuery, state: FSMCont
     )
 
 
-@router.message(FeatureStates.contract_title, F.text)
+@router.message(FeatureStates.contract_title, F.text, ~F.text.startswith("/"))
 async def feature_contracts_title_input(message: Message, state: FSMContext):
     title = (message.text or "").strip()
     if len(title) < 4:
@@ -1542,7 +1542,7 @@ async def feature_contracts_title_input(message: Message, state: FSMContext):
     await message.answer("Опишите задачу контракта:", parse_mode=None)
 
 
-@router.message(FeatureStates.contract_description, F.text)
+@router.message(FeatureStates.contract_description, F.text, ~F.text.startswith("/"))
 async def feature_contracts_description_input(message: Message, state: FSMContext):
     desc = (message.text or "").strip()
     if len(desc) < 8:
@@ -1553,7 +1553,7 @@ async def feature_contracts_description_input(message: Message, state: FSMContex
     await message.answer("Введите награду в долларах (например: 15000):", parse_mode=None)
 
 
-@router.message(FeatureStates.contract_reward, F.text)
+@router.message(FeatureStates.contract_reward, F.text, ~F.text.startswith("/"))
 async def feature_contracts_reward_input(message: Message, state: FSMContext):
     amount = _parse_amount(message.text or "")
     if amount is None:
@@ -1752,7 +1752,7 @@ async def feature_bank_wd_manual_start(callback: CallbackQuery, state: FSMContex
     )
 
 
-@router.message(FeatureStates.bank_deposit_amount, F.text)
+@router.message(FeatureStates.bank_deposit_amount, F.text, ~F.text.startswith("/"))
 async def feature_bank_dep_manual_input(message: Message, state: FSMContext):
     amount = _parse_amount(message.text or "")
     if amount is None:
@@ -1763,7 +1763,7 @@ async def feature_bank_dep_manual_input(message: Message, state: FSMContext):
     await message.answer(("✅ " if ok else "❌ ") + msg, reply_markup=_back("bank_deposit"), parse_mode=None)
 
 
-@router.message(FeatureStates.bank_withdraw_amount, F.text)
+@router.message(FeatureStates.bank_withdraw_amount, F.text, ~F.text.startswith("/"))
 async def feature_bank_wd_manual_input(message: Message, state: FSMContext):
     amount = _parse_amount(message.text or "")
     if amount is None:
@@ -2271,3 +2271,4 @@ async def feature_org_finances(callback: CallbackQuery, state: FSMContext):
         reply_markup=_back("manage_organization"),
         parse_mode="Markdown",
     )
+

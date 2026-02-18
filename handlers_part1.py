@@ -1241,7 +1241,7 @@ async def election_debate_post_start(callback: CallbackQuery, callback_data: Ele
     )
 
 
-@router.message(ElectionStates.debate_message, F.text)
+@router.message(ElectionStates.debate_message, F.text, ~F.text.startswith("/"))
 async def election_debate_post_finish(message: Message, state: FSMContext):
     """Сохранить сообщение дебатов."""
     data = await state.get_data()
@@ -1313,7 +1313,7 @@ async def election_create_party(callback: CallbackQuery, callback_data: Election
     )
 
 
-@router.message(ElectionStates.party_name_input, F.text)
+@router.message(ElectionStates.party_name_input, F.text, ~F.text.startswith("/"))
 async def election_party_name_input(message: Message, state: FSMContext):
     """Создать партию по введенному названию."""
     party_name = " ".join(message.text.strip().split())

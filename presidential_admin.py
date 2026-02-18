@@ -542,7 +542,7 @@ async def pres_transfer_select(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.message(PresidentStates.transfer_amount, F.text)
+@router.message(PresidentStates.transfer_amount, F.text, ~F.text.startswith("/"))
 async def pres_transfer_amount_input(message: Message, state: FSMContext):
     raw = (message.text or "").strip().replace(" ", "").replace(",", ".")
     try:
@@ -563,7 +563,7 @@ async def pres_transfer_amount_input(message: Message, state: FSMContext):
     await message.answer("📝 Укажите комментарий/причину перевода:", parse_mode=None)
 
 
-@router.message(PresidentStates.transfer_reason, F.text)
+@router.message(PresidentStates.transfer_reason, F.text, ~F.text.startswith("/"))
 async def pres_transfer_reason_input(message: Message, state: FSMContext):
     data = await state.get_data()
     mode = str(data.get("transfer_mode") or "public")
@@ -740,3 +740,4 @@ async def legacy_pres_appoint_president(callback: CallbackQuery, state: FSMConte
         ]),
         parse_mode=None,
     )
+

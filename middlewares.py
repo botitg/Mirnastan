@@ -262,6 +262,8 @@ class GlobalLockMiddleware(BaseMiddleware):
 
             # Разрешаем только базовые команды во время глобальной блокировки.
             command = (event.text or "").strip().split(" ", 1)[0].lower()
+            if "@" in command:
+                command = command.split("@", 1)[0]
             if command in {"/start", "/menu", "/help", "/id"}:
                 return await handler(event, data)
 
