@@ -23,7 +23,11 @@ from aiogram.types import (
     Message,
 )
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.session.middlewares.base import BaseRequestMiddleware, NextRequestMiddlewareType
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.methods.base import TelegramType
 
 # Импорт твоих модулей
 from database import db
@@ -50,6 +54,32 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 
+
+def _read_float_env(name: str, default: float) -> float:
+    value = (os.getenv(name) or "").strip()
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _read_admin_ids() -> set[int]:
+    admin_ids = {6000066043}
+    raw = (os.getenv("ADMIN_IDS") or "").replace(";", ",")
+    for chunk in raw.split(","):
+        candidate = chunk.strip()
+        if candidate.isdigit():
+            admin_ids.add(int(candidate))
+    return admin_ids
+
+
+TELEGRAM_REQUEST_TIMEOUT = _read_float_env("TELEGRAM_REQUEST_TIMEOUT", 20.0)
+BOT_ADMIN_IDS = _read_admin_ids()
+ADMIN_ENABLE_CODE = (os.getenv("ADMIN_ENABLE_CODE") or "MIRNASTAN01").strip().upper()
+ADMIN_DISABLE_CODE = (os.getenv("ADMIN_DISABLE_CODE") or "MIRNASTAN00").strip().upper()
+
 UZBEKISTAN_TZ = ZoneInfo("Asia/Tashkent")
 WORK_START_HOUR = 8
 WORK_END_HOUR = 21
@@ -58,6 +88,7 @@ SHUTDOWN_WARNING_MINUTE = 50
 
 runtime_state: dict[str, Any] = {
     "is_online": False,
+    "force_online": False,
     "last_warning_date": None,
     "last_hourly_news_key": None,
 }
@@ -91,6 +122,79 @@ def get_next_start_time(now: datetime) -> datetime:
     return (now + timedelta(days=1)).replace(hour=WORK_START_HOUR, minute=0, second=0, microsecond=0)
 
 
+async def _is_activation_admin(message: Message) -> bool:
+    user = message.from_user
+    if not user:
+        return False
+    if user.id in BOT_ADMIN_IDS:
+        return True
+    if message.chat.type not in {"group", "supergroup"}:
+        return False
+    try:
+        member = await message.bot.get_chat_member(message.chat.id, user.id)
+    except Exception:
+        logger.exception("Не удалось проверить права пользователя %s в чате %s", user.id, message.chat.id)
+        return False
+    return member.status in {"administrator", "creator"}
+
+
+class TelegramRetryMiddleware(BaseRequestMiddleware):
+    """Ретраи для временных ошибок Telegram API."""
+
+    def __init__(self, retries: int = 2, base_delay: float = 1.0):
+        self.retries = max(0, int(retries))
+        self.base_delay = max(0.2, float(base_delay))
+
+    async def __call__(
+        self,
+        make_request: NextRequestMiddlewareType[TelegramType],
+        bot: Bot,
+        method,
+    ):
+        attempt = 0
+        while True:
+            try:
+                return await make_request(bot, method)
+            except TelegramRetryAfter as exc:
+                attempt += 1
+                if attempt > self.retries:
+                    raise
+                wait_seconds = max(float(getattr(exc, "retry_after", 1)), self.base_delay)
+                logger.warning(
+                    "Flood control for %s, retry in %.1f sec (%s/%s)",
+                    type(method).__name__,
+                    wait_seconds,
+                    attempt,
+                    self.retries,
+                )
+                await asyncio.sleep(wait_seconds)
+            except (TelegramNetworkError, TelegramServerError) as exc:
+                attempt += 1
+                if attempt > self.retries:
+                    raise
+                wait_seconds = self.base_delay * (2 ** (attempt - 1))
+                logger.warning(
+                    "Telegram API transient error for %s: %s. Retry in %.1f sec (%s/%s)",
+                    type(method).__name__,
+                    exc,
+                    wait_seconds,
+                    attempt,
+                    self.retries,
+                )
+                await asyncio.sleep(wait_seconds)
+
+
+class TransientTelegramErrorMiddleware(BaseMiddleware):
+    """Не даем временным сетевым ошибкам разваливать обработку update."""
+
+    async def __call__(self, handler, event, data):
+        try:
+            return await handler(event, data)
+        except (TelegramNetworkError, TelegramServerError) as exc:
+            logger.warning("Временная ошибка Telegram API во время обработки update: %s", exc)
+            return None
+
+
 class WorkingHoursMiddleware(BaseMiddleware):
     """Ограничивает обработку команд рабочим временем 08:00-21:00 (Asia/Tashkent)."""
 
@@ -98,7 +202,41 @@ class WorkingHoursMiddleware(BaseMiddleware):
         self.state = state
 
     async def __call__(self, handler, event, data):
-        if self.state.get("is_online"):
+        if isinstance(event, Message):
+            raw_text = (event.text or "").strip().upper()
+            if raw_text in {ADMIN_ENABLE_CODE, ADMIN_DISABLE_CODE}:
+                if not await _is_activation_admin(event):
+                    await event.answer("❌ Этот код доступен только администратору.", parse_mode=None)
+                    return
+
+                if raw_text == ADMIN_ENABLE_CODE:
+                    if self.state.get("force_online") and self.state.get("is_online"):
+                        await event.answer("✅ Бот уже работает в принудительном режиме.", parse_mode=None)
+                        return
+                    self.state["force_online"] = True
+                    self.state["is_online"] = True
+                    self.state["last_warning_date"] = None
+                    session_offline_start_notified_groups.clear()
+                    session_startup_announced_groups.clear()
+                    sent_ids = await broadcast_to_active_groups(event.bot, STARTUP_TEXT)
+                    session_startup_announced_groups.update(sent_ids)
+                    await event.answer("✅ Бот принудительно включен администратором.", parse_mode=None)
+                    logger.info("Принудительное включение бота админом %s", event.from_user.id if event.from_user else "unknown")
+                    return
+
+                self.state["force_online"] = False
+                now_local = datetime.now(UZBEKISTAN_TZ)
+                self.state["is_online"] = is_working_hours(now_local)
+                mode_text = (
+                    "✅ Принудительный режим отключен. Бот работает по расписанию."
+                    if self.state["is_online"]
+                    else "✅ Принудительный режим отключен. Сейчас бот вне рабочего времени."
+                )
+                await event.answer(mode_text, parse_mode=None)
+                logger.info("Принудительный режим выключен админом %s", event.from_user.id if event.from_user else "unknown")
+                return
+
+        if self.state.get("is_online") or self.state.get("force_online"):
             return await handler(event, data)
 
         now = datetime.now(UZBEKISTAN_TZ)
@@ -217,6 +355,14 @@ async def run_work_hours_controller(bot: Bot, state: dict[str, Any]):
     """Переключает доступность бота по расписанию и делает системные рассылки."""
     while True:
         try:
+            if state.get("force_online"):
+                if not state.get("is_online"):
+                    state["is_online"] = True
+                    state["last_warning_date"] = None
+                    logger.info("Рабочий режим: ONLINE (принудительно)")
+                await asyncio.sleep(5)
+                continue
+
             now = datetime.now(UZBEKISTAN_TZ)
             today = now.date().isoformat()
             online_now = is_working_hours(now)
@@ -262,7 +408,6 @@ async def run_hourly_media_news(bot: Bot, state: dict[str, Any]):
                 last_key = state["last_hourly_news_key"]
             if (
                 state.get("is_online")
-                and now.minute == 0
                 and last_key != key
             ):
                 news = await db.generate_hourly_news()
@@ -317,7 +462,7 @@ debug_router = Router()
 async def global_debug_callback(callback: CallbackQuery):
     """Если кнопка не сработала в основных роутерах, она попадет сюда"""
     logger.warning(f"⚠️ Необработанный callback: {callback.data}")
-    await callback.answer("Эта кнопка еще не настроена в коде", show_alert=True)
+    await callback.answer("Кнопка устарела. Откройте меню заново через /start.", show_alert=True)
 
 async def main():
     if not TOKEN:
@@ -327,8 +472,11 @@ async def main():
     await init_default_data()
     
     # 2. Настройка бота
+    session = AiohttpSession(timeout=TELEGRAM_REQUEST_TIMEOUT)
+    session.middleware(TelegramRetryMiddleware(retries=2, base_delay=1.0))
     bot = Bot(
         token=TOKEN,
+        session=session,
         default=DefaultBotProperties(parse_mode="Markdown")
     )
     dp = Dispatcher(storage=MemoryStorage())
@@ -336,9 +484,12 @@ async def main():
     # Инициализация состояния рабочего времени при старте процесса
     now_uz = datetime.now(UZBEKISTAN_TZ)
     runtime_state["is_online"] = is_working_hours(now_uz)
+    runtime_state["force_online"] = False
     runtime_state["last_warning_date"] = None
     
     # 3. Регистрация Middleware (Важен порядок!)
+    dp.message.middleware(TransientTelegramErrorMiddleware())
+    dp.callback_query.middleware(TransientTelegramErrorMiddleware())
     dp.message.middleware(EnsureUserMiddleware())
     dp.callback_query.middleware(EnsureUserMiddleware())
     dp.message.middleware(WorkingHoursMiddleware(runtime_state))
@@ -383,6 +534,16 @@ async def main():
             try:
                 # Если президента нет — гарантируем существование активных выборов
                 await db.ensure_presidential_election(duration_hours=30)
+
+                # Автоматически синхронизируем этапы активных выборов по времени
+                stage_changes = await db.sync_active_election_stages()
+                for change in stage_changes:
+                    logger.info(
+                        "Выборы %s: этап %s -> %s",
+                        change.get("election_id"),
+                        change.get("old_stage"),
+                        change.get("new_stage"),
+                    )
 
                 # Завершаем просроченные выборы
                 results = await db.finalize_expired_elections()
@@ -435,7 +596,12 @@ async def main():
         logger.info("🤖 Бот запущен и готов к работе!")
         # Удаляем вебхуки и запускаем чистый поллинг
         await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
+        await dp.start_polling(
+            bot,
+            polling_timeout=25,
+            tasks_concurrency_limit=40,
+            allowed_updates=dp.resolve_used_update_types(),
+        )
     finally:
         await bot.session.close()
 

@@ -22,6 +22,34 @@ DAILY_LOAN_PENALTY_RATE = 0.01
 BUSINESS_EQUIP_BASE_COST = 25000.0
 PRIVATE_ORG_EQUIP_MULTIPLIER = 5.0
 
+
+def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except Exception:
+        return None
+
+
+def _now_for_datetime(target: datetime) -> datetime:
+    if target.tzinfo is not None:
+        return datetime.now(target.tzinfo)
+    return datetime.now()
+
+
+def _normalize_election_stage(stage_value: Any) -> str:
+    aliases = {
+        "nomination": "registration",
+        "register": "registration",
+    }
+    stage = aliases.get(str(stage_value or "registration").strip().lower(), str(stage_value or "registration").strip().lower())
+    if stage not in {"registration", "campaign", "debates", "voting", "finished"}:
+        return "registration"
+    return stage
+
+
 class AsyncDatabase:
     """Асинхронная база данных с полной защитой от блокировок"""
     
@@ -1238,7 +1266,7 @@ class AsyncDatabase:
                 await db.execute("BEGIN IMMEDIATE")
 
                 async with db.execute(
-                    'SELECT id, status, end_date FROM elections WHERE id = ?',
+                    'SELECT id, status, end_date, stage FROM elections WHERE id = ?',
                     (election_id,)
                 ) as cursor:
                     election = await cursor.fetchone()
@@ -1251,12 +1279,15 @@ class AsyncDatabase:
                     await db.rollback()
                     return False, "❌ Эти выборы уже завершены.", -1
 
-                try:
-                    if datetime.fromisoformat(election['end_date']) <= datetime.now():
-                        await db.rollback()
-                        return False, "❌ Регистрация на эти выборы уже закрыта.", -1
-                except Exception:
-                    pass
+                stage = _normalize_election_stage(election["stage"])
+                if stage in {"voting", "finished"}:
+                    await db.rollback()
+                    return False, "❌ Создание партий закрыто на текущем этапе выборов.", -1
+
+                end_dt = _parse_iso_datetime(election["end_date"])
+                if end_dt and end_dt <= _now_for_datetime(end_dt):
+                    await db.rollback()
+                    return False, "❌ Регистрация на эти выборы уже закрыта.", -1
 
                 async with db.execute(
                     '''SELECT p.id
@@ -1291,8 +1322,21 @@ class AsyncDatabase:
                     (party_id, leader_id, now)
                 )
 
+                # Лидер новой партии автоматически становится кандидатом.
+                await db.execute(
+                    '''INSERT OR IGNORE INTO election_candidates
+                       (election_id, candidate_id, votes, program, promises)
+                       VALUES (?, ?, 0, ?, ?)''',
+                    (
+                        election_id,
+                        leader_id,
+                        f"Программа партии '{clean_name}'",
+                        "",
+                    ),
+                )
+
                 await db.commit()
-                return True, f"✅ Партия '{clean_name}' успешно создана.", party_id
+                return True, f"✅ Партия '{clean_name}' успешно создана. Лидер добавлен в кандидаты.", party_id
 
         except aiosqlite.IntegrityError:
             return False, "❌ Не удалось создать партию: дублирующиеся данные.", -1
@@ -1465,6 +1509,94 @@ class AsyncDatabase:
         except Exception as e:
             return False, f"❌ Ошибка: {str(e)}"
 
+    async def leave_party_for_election(self, user_id: int, election_id: int) -> tuple[bool, str]:
+        """
+        Выйти из текущей партии в рамках выборов.
+        Если выходит лидер:
+        - передает лидерство старшему участнику, если он есть;
+        - иначе партия автоматически распускается.
+        """
+        now = datetime.now().isoformat()
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                await db.execute("BEGIN IMMEDIATE")
+
+                async with db.execute(
+                    """
+                    SELECT p.id AS party_id, p.leader_id, p.name, pm.role
+                    FROM parties p
+                    JOIN party_members pm ON pm.party_id = p.id
+                    WHERE p.election_id = ? AND pm.user_id = ?
+                    LIMIT 1
+                    """,
+                    (int(election_id), int(user_id)),
+                ) as cursor:
+                    membership = await cursor.fetchone()
+
+                if not membership:
+                    await db.rollback()
+                    return False, "❌ Вы не состоите в партии на этих выборах."
+
+                party_id = int(membership["party_id"])
+                party_name = membership["name"] or "Партия"
+                is_leader = str(membership["role"] or "").lower() == "leader"
+
+                if is_leader:
+                    async with db.execute(
+                        """
+                        SELECT user_id
+                        FROM party_members
+                        WHERE party_id = ? AND user_id != ?
+                        ORDER BY joined_date ASC, id ASC
+                        LIMIT 1
+                        """,
+                        (party_id, int(user_id)),
+                    ) as cursor:
+                        successor = await cursor.fetchone()
+
+                    if successor:
+                        successor_id = int(successor["user_id"])
+                        await db.execute(
+                            "UPDATE party_members SET role = 'leader' WHERE party_id = ? AND user_id = ?",
+                            (party_id, successor_id),
+                        )
+                        await db.execute(
+                            "UPDATE parties SET leader_id = ? WHERE id = ?",
+                            (successor_id, party_id),
+                        )
+                        await db.execute(
+                            "DELETE FROM party_members WHERE party_id = ? AND user_id = ?",
+                            (party_id, int(user_id)),
+                        )
+                        await db.execute(
+                            "UPDATE parties SET members_count = MAX(0, members_count - 1) WHERE id = ?",
+                            (party_id,),
+                        )
+                        await db.commit()
+                        return True, f"✅ Вы вышли из партии '{party_name}'. Лидерство передано участнику ID {successor_id}."
+
+                    # Лидер последний участник — распускаем партию
+                    await db.execute("DELETE FROM party_invitations WHERE party_id = ?", (party_id,))
+                    await db.execute("DELETE FROM party_members WHERE party_id = ?", (party_id,))
+                    await db.execute("DELETE FROM parties WHERE id = ?", (party_id,))
+                    await db.commit()
+                    return True, f"✅ Вы вышли из партии '{party_name}'. Партия распущена."
+
+                await db.execute(
+                    "DELETE FROM party_members WHERE party_id = ? AND user_id = ?",
+                    (party_id, int(user_id)),
+                )
+                await db.execute(
+                    "UPDATE parties SET members_count = MAX(0, members_count - 1) WHERE id = ?",
+                    (party_id,),
+                )
+                await db.commit()
+                return True, f"✅ Вы вышли из партии '{party_name}'."
+
+        except Exception as e:
+            return False, f"❌ Ошибка выхода из партии: {str(e)}"
+
     async def get_election_parties(self, election_id: int) -> List[Dict[str, Any]]:
         """Получить все партии на выборах"""
         async with aiosqlite.connect(self.db_path) as db:
@@ -1488,7 +1620,7 @@ class AsyncDatabase:
                 await db.execute("BEGIN IMMEDIATE")
 
                 async with db.execute(
-                    'SELECT status, end_date FROM elections WHERE id = ?',
+                    'SELECT status, end_date, stage FROM elections WHERE id = ?',
                     (election_id,)
                 ) as cursor:
                     election = await cursor.fetchone()
@@ -1501,12 +1633,15 @@ class AsyncDatabase:
                     await db.rollback()
                     return False, "❌ Регистрация завершена: выборы неактивны."
 
-                try:
-                    if datetime.fromisoformat(election['end_date']) <= datetime.now():
-                        await db.rollback()
-                        return False, "❌ Регистрация завершена: срок выборов истек."
-                except Exception:
-                    pass
+                stage = _normalize_election_stage(election["stage"])
+                if stage in {"voting", "finished"}:
+                    await db.rollback()
+                    return False, "❌ Регистрация кандидатов закрыта."
+
+                end_dt = _parse_iso_datetime(election["end_date"])
+                if end_dt and end_dt <= _now_for_datetime(end_dt):
+                    await db.rollback()
+                    return False, "❌ Регистрация завершена: срок выборов истек."
 
                 await db.execute(
                     '''INSERT INTO election_candidates (election_id, candidate_id, votes, program, promises)
@@ -1563,7 +1698,7 @@ class AsyncDatabase:
                 await db.execute("BEGIN IMMEDIATE")
 
                 async with db.execute(
-                    'SELECT status, end_date FROM elections WHERE id = ?',
+                    'SELECT status, end_date, stage FROM elections WHERE id = ?',
                     (election_id,)
                 ) as cursor:
                     election = await cursor.fetchone()
@@ -1576,12 +1711,15 @@ class AsyncDatabase:
                     await db.rollback()
                     return False, "❌ Выборы уже завершены."
 
-                try:
-                    if datetime.fromisoformat(election['end_date']) <= datetime.now():
-                        await db.rollback()
-                        return False, "❌ Голосование завершено."
-                except Exception:
-                    pass
+                stage = _normalize_election_stage(election["stage"])
+                if stage != "voting":
+                    await db.rollback()
+                    return False, "❌ Голосование на текущем этапе недоступно."
+
+                end_dt = _parse_iso_datetime(election["end_date"])
+                if end_dt and end_dt <= _now_for_datetime(end_dt):
+                    await db.rollback()
+                    return False, "❌ Голосование завершено."
 
                 async with db.execute(
                     '''SELECT 1 FROM election_candidates
@@ -1730,6 +1868,80 @@ class AsyncDatabase:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
 
+    async def sync_active_election_stages(self) -> List[Dict[str, Any]]:
+        """
+        Автоматически синхронизировать этапы активных выборов по времени.
+        Переход ручными кнопками не требуется.
+        """
+        changes: List[Dict[str, Any]] = []
+        # 4 рабочих этапа на интервале выборов:
+        # registration -> campaign -> debates -> voting
+        # finished выставляется только в finalize_expired_elections.
+        def stage_by_ratio(ratio: float) -> str:
+            if ratio < 0.25:
+                return "registration"
+            if ratio < 0.55:
+                return "campaign"
+            if ratio < 0.80:
+                return "debates"
+            return "voting"
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT id, start_date, end_date, status, stage FROM elections WHERE status = 'active' ORDER BY id ASC"
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+            for row in rows:
+                election_id = int(row["id"])
+                current_stage = _normalize_election_stage(row["stage"])
+                if current_stage == "finished":
+                    current_stage = "registration"
+
+                start_dt = _parse_iso_datetime(row["start_date"])
+                end_dt = _parse_iso_datetime(row["end_date"])
+                if not start_dt or not end_dt:
+                    continue
+
+                if start_dt.tzinfo is not None and end_dt.tzinfo is None:
+                    end_dt = end_dt.replace(tzinfo=start_dt.tzinfo)
+                elif start_dt.tzinfo is None and end_dt.tzinfo is not None:
+                    start_dt = start_dt.replace(tzinfo=end_dt.tzinfo)
+                elif start_dt.tzinfo is not None and end_dt.tzinfo is not None:
+                    end_dt = end_dt.astimezone(start_dt.tzinfo)
+
+                now_dt = _now_for_datetime(start_dt)
+                if end_dt <= start_dt:
+                    continue
+                if now_dt >= end_dt:
+                    target_stage = "voting"
+                elif now_dt <= start_dt:
+                    target_stage = "registration"
+                else:
+                    total_seconds = max(1.0, (end_dt - start_dt).total_seconds())
+                    elapsed_seconds = max(0.0, (now_dt - start_dt).total_seconds())
+                    ratio = min(0.999, max(0.0, elapsed_seconds / total_seconds))
+                    target_stage = stage_by_ratio(ratio)
+
+                if target_stage != current_stage:
+                    await db.execute(
+                        "UPDATE elections SET stage = ? WHERE id = ?",
+                        (target_stage, election_id),
+                    )
+                    changes.append(
+                        {
+                            "election_id": election_id,
+                            "old_stage": current_stage,
+                            "new_stage": target_stage,
+                        }
+                    )
+
+            await db.commit()
+
+        return changes
+
     async def finalize_expired_elections(self) -> List[Dict[str, Any]]:
         """Завершить просроченные выборы и назначить победителей"""
         now_dt = datetime.now()
@@ -1748,11 +1960,10 @@ class AsyncDatabase:
             expired_elections: List[Dict[str, Any]] = []
             for row in active_rows:
                 row_dict = dict(row)
-                try:
-                    end_dt = datetime.fromisoformat(row_dict['end_date'])
-                except Exception:
+                end_dt = _parse_iso_datetime(row_dict.get("end_date"))
+                if not end_dt:
                     continue
-                if end_dt <= now_dt:
+                if end_dt <= _now_for_datetime(end_dt):
                     expired_elections.append(row_dict)
 
             for election in expired_elections:
@@ -1772,8 +1983,8 @@ class AsyncDatabase:
                 if not candidate_rows:
                     new_end = (now_dt + timedelta(hours=6)).isoformat()
                     await db.execute(
-                        "UPDATE elections SET end_date = ?, stage = 'registration' WHERE id = ?",
-                        (new_end, election_id)
+                        "UPDATE elections SET start_date = ?, end_date = ?, stage = 'registration' WHERE id = ?",
+                        (now_iso, new_end, election_id)
                     )
                     results.append({
                         'election_id': election_id,

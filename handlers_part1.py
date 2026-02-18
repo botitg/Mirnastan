@@ -139,7 +139,7 @@ async def _dispatch_menu_action(callback: CallbackQuery, state: FSMContext, acti
         await feature_gang_menu(callback, state)
         return
 
-    await callback.answer("❌ Раздел пока недоступен.", show_alert=True)
+    await callback.answer("❌ Неизвестное действие меню.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("menu:"))
@@ -250,20 +250,19 @@ async def back_to_main(callback: CallbackQuery, state: FSMContext):
         
         # Проверяем, есть ли активные выборы
         has_president = await db.check_has_president()
-        gov = await db.get_organization("Правительство")
         has_elections = False
         election_id = -1
-        
-        if gov and not has_president:
+
+        if not has_president:
             await db.ensure_presidential_election(duration_hours=30)
             active_pres = await db.get_active_presidential_election()
             has_elections = active_pres is not None
             if active_pres:
                 election_id = active_pres['id']
         
-        # Если пользователь находится в состоянии выборов — вернем в меню выборов
+        # При активных выборах главное меню недоступно: всегда возвращаем в меню выборов.
         current_state = await state.get_state()
-        if current_state and current_state.startswith("ElectionStates"):
+        if has_elections or (current_state and current_state.startswith("ElectionStates")):
             await state.set_state(ElectionStates.global_lock)
             try:
                 await callback.edit_message_text(
@@ -327,10 +326,9 @@ async def start_command(message: Message, state: FSMContext):
     
     # Проверяем, есть ли активные выборы и нет ли президента
     has_president = await db.check_has_president()
-    gov = await db.get_organization("Правительство")
     has_elections = False
-    
-    if gov and not has_president:
+
+    if not has_president:
         await db.ensure_presidential_election(duration_hours=30)
         active_pres = await db.get_active_presidential_election()
         has_elections = active_pres is not None
@@ -1039,15 +1037,16 @@ async def _send_party_invitation(
 
 
 @router.callback_query(ElectionCallback.filter(F.action == "view"))
-async def election_view_brief(callback: CallbackQuery, callback_data: ElectionCallback):
+async def election_view_brief(callback: CallbackQuery, callback_data: ElectionCallback, state: FSMContext):
     """Совместимость со старой кнопкой view."""
-    await election_view_party(callback, callback_data)
+    await election_view_party(callback, callback_data, state)
 
 
 @router.callback_query(ElectionCallback.filter(F.action == "view_party"))
-async def election_view_party(callback: CallbackQuery, callback_data: ElectionCallback):
+async def election_view_party(callback: CallbackQuery, callback_data: ElectionCallback, state: FSMContext):
     """Главное меню выборов."""
     await callback.answer()
+    await state.set_state(ElectionStates.global_lock)
 
     user_id = callback.from_user.id
     election_id = await _resolve_active_election_id(callback_data.election_id)
@@ -1071,7 +1070,6 @@ async def election_view_party(callback: CallbackQuery, callback_data: ElectionCa
     user_party = await db.get_user_party_for_election(user_id, election_id)
     candidates = await db.get_election_candidates(election_id)
     has_voted = await db.has_user_voted(election_id, user_id)
-    can_manage_stage = await _can_manage_election_stage(user_id, election_id)
     stage_label = _election_stage_label(election.get("stage"))
 
     text_lines = [
@@ -1116,6 +1114,12 @@ async def election_view_party(callback: CallbackQuery, callback_data: ElectionCa
                 callback_data=PartyCallback(action="view_members", party_id=user_party['id'], election_id=election_id).pack(),
             )
         ])
+        buttons.append([
+            InlineKeyboardButton(
+                text="🔁 Сменить/покинуть партию",
+                callback_data=PartyCallback(action="leave", party_id=user_party['id'], election_id=election_id).pack(),
+            )
+        ])
         if int(user_party.get('leader_id') or 0) == user_id:
             buttons.append([
                 InlineKeyboardButton(
@@ -1130,24 +1134,17 @@ async def election_view_party(callback: CallbackQuery, callback_data: ElectionCa
         [InlineKeyboardButton(text="✍️ Написать в дебаты", callback_data=ElectionCallback(action="debate_post", election_id=election_id).pack())],
         [InlineKeyboardButton(text="🗳️ Голосовать", callback_data=ElectionCallback(action="vote_menu", election_id=election_id).pack())],
         [InlineKeyboardButton(text="📋 Кандидаты", callback_data=ElectionCallback(action="view_candidates", election_id=election_id).pack())],
-        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="back_to_main")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")],
     ])
-
-    if can_manage_stage:
-        buttons.insert(
-            0,
-            [InlineKeyboardButton(text="⏭️ Следующий этап выборов", callback_data=ElectionCallback(action="stage_next", election_id=election_id).pack())],
-        )
 
     await _safe_edit(callback, "\n".join(text_lines), InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
 @router.callback_query(ElectionCallback.filter(F.action == "stage_next"))
 async def election_stage_next(callback: CallbackQuery, callback_data: ElectionCallback):
-    """Перевод выборов на следующий этап (для уполномоченных)."""
+    """Ручной перевод этапов отключен: этапы меняются автоматически."""
     await callback.answer()
 
-    user_id = callback.from_user.id
     election_id = await _resolve_active_election_id(callback_data.election_id)
     if election_id <= 0:
         await _safe_edit(
@@ -1157,19 +1154,11 @@ async def election_stage_next(callback: CallbackQuery, callback_data: ElectionCa
         )
         return
 
-    if not await _can_manage_election_stage(user_id, election_id):
-        await callback.answer("❌ У вас нет прав менять этапы выборов.", show_alert=True)
-        return
-
-    success, msg, new_stage = await db.cycle_election_stage(election_id)
-    stage_label = _election_stage_label(new_stage)
-    if not success:
-        await _safe_edit(callback, f"❌ {msg}", _election_back_markup(election_id))
-        return
-
+    election = await db.get_election(election_id)
+    stage_label = _election_stage_label((election or {}).get("stage"))
     text = (
-        "✅ Этап выборов обновлен.\n"
-        f"Новый этап: {stage_label}"
+        "ℹ️ Этапы выборов меняются автоматически по времени.\n"
+        f"Текущий этап: {stage_label}"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎤 Открыть дебаты", callback_data=ElectionCallback(action="debates", election_id=election_id).pack())],
@@ -1313,16 +1302,6 @@ async def election_create_party(callback: CallbackQuery, callback_data: Election
         )
         return
 
-    election = await db.get_election(election_id)
-    stage = str((election or {}).get("stage") or "").lower()
-    if stage in {"voting", "finished"}:
-        await _safe_edit(
-            callback,
-            f"❌ На этапе '{_election_stage_label(stage)}' создание партий закрыто.",
-            _election_back_markup(election_id),
-        )
-        return
-
     await state.set_state(ElectionStates.party_name_input)
     await state.update_data(election_id=election_id)
 
@@ -1370,7 +1349,8 @@ async def election_party_name_input(message: Message, state: FSMContext):
 
     await message.answer(
         f"✅ Партия '{party_name}' зарегистрирована.\n"
-        "Теперь можно пригласить участников и выдвинуться кандидатом.",
+        "Лидер партии автоматически добавлен в кандидаты.\n"
+        "Теперь можно приглашать участников и вести кампанию.",
         reply_markup=keyboard,
         parse_mode=None,
     )
@@ -1598,10 +1578,12 @@ async def election_list_parties(callback: CallbackQuery, callback_data: Election
 
         text += f"• {pname}\n  Лидер: {leader_name}\n  Участников: {members_count} | Голосов: {votes_total}\n\n"
 
-        if not user_party and int(p.get('leader_id') or 0) != user_id:
+        is_own_party = bool(user_party and int(user_party.get('id') or -1) == int(p.get('id') or -2))
+        if (not is_own_party) and int(p.get('leader_id') or 0) != user_id:
+            join_label = f"➕ Вступить: {pname}" if not user_party else f"🔁 Перейти: {pname}"
             buttons.append([
                 InlineKeyboardButton(
-                    text=f"➕ Вступить: {pname}",
+                    text=join_label,
                     callback_data=PartyCallback(action="request_join", party_id=p['id'], election_id=election_id).pack(),
                 )
             ])
@@ -1638,10 +1620,26 @@ async def party_request_join(callback: CallbackQuery, callback_data: PartyCallba
         await _safe_edit(callback, "❌ Партия не найдена.", _election_back_markup(election_id))
         return
 
-    current_party = await db.get_user_party_for_election(user_id, election_id)
-    if current_party:
-        await _safe_edit(callback, "❌ Вы уже состоите в партии на этих выборах.", _election_back_markup(election_id))
+    if int(party.get('leader_id') or 0) == user_id:
+        await _safe_edit(callback, "❌ Вы уже лидер этой партии.", _election_back_markup(election_id))
         return
+
+    election = await db.get_election(election_id)
+    if not election or str(election.get("status") or "") != "active":
+        await _safe_edit(callback, "❌ Выборы уже завершены.", _election_back_markup(election_id))
+        return
+
+    current_party = await db.get_user_party_for_election(user_id, election_id)
+    switch_note = ""
+    if current_party:
+        if int(current_party.get("id") or -1) == party_id:
+            await _safe_edit(callback, "❌ Вы уже состоите в этой партии.", _election_back_markup(election_id))
+            return
+        left_ok, left_msg = await db.leave_party_for_election(user_id, election_id)
+        if not left_ok:
+            await _safe_edit(callback, left_msg, _election_back_markup(election_id))
+            return
+        switch_note = f"{left_msg}\n"
 
     now = datetime.now().isoformat()
     async with aiosqlite.connect(db.db_path) as conn:
@@ -1686,7 +1684,45 @@ async def party_request_join(callback: CallbackQuery, callback_data: PartyCallba
         except Exception:
             pass
 
-    await _safe_edit(callback, "✅ Запрос отправлен лидеру партии.", _election_back_markup(election_id))
+    await _safe_edit(callback, f"{switch_note}✅ Запрос отправлен лидеру партии.", _election_back_markup(election_id))
+
+
+@router.callback_query(PartyCallback.filter(F.action == "leave"))
+async def party_leave(callback: CallbackQuery, callback_data: PartyCallback):
+    """Покинуть текущую партию, чтобы вступить в другую."""
+    await callback.answer()
+
+    user_id = callback.from_user.id
+    election_id = await _resolve_active_election_id(callback_data.election_id)
+    if election_id <= 0:
+        await _safe_edit(
+            callback,
+            "❌ Сейчас нет активных выборов.",
+            InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]])
+        )
+        return
+
+    election = await db.get_election(election_id)
+    if not election or str(election.get("status") or "") != "active":
+        await _safe_edit(callback, "❌ Выборы уже завершены.", _election_back_markup(election_id))
+        return
+
+    current_party = await db.get_user_party_for_election(user_id, election_id)
+    if not current_party:
+        await _safe_edit(callback, "❌ Вы не состоите в партии.", _election_back_markup(election_id))
+        return
+
+    ok, msg = await db.leave_party_for_election(user_id, election_id)
+    if not ok:
+        await _safe_edit(callback, msg, _election_back_markup(election_id))
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📜 Выбрать новую партию", callback_data=ElectionCallback(action="list_parties", election_id=election_id).pack())],
+        [InlineKeyboardButton(text="🟢 Создать свою партию", callback_data=ElectionCallback(action="create_party", election_id=election_id).pack())],
+        [InlineKeyboardButton(text="🔙 В меню выборов", callback_data=ElectionCallback(action="view_party", election_id=election_id).pack())],
+    ])
+    await _safe_edit(callback, msg, keyboard)
 
 
 @router.callback_query(PartyCallback.filter(F.action == "handle_request"))
@@ -1711,6 +1747,15 @@ async def party_handle_request(callback: CallbackQuery, callback_data: PartyCall
     party = await db.get_party(party_id)
     if not party:
         await _safe_edit(callback, "❌ Партия не найдена.", _election_back_markup(election_id))
+        return
+
+    if int(party.get("election_id") or -1) != election_id:
+        await _safe_edit(callback, "❌ Заявка относится к другим выборам.", _election_back_markup(election_id))
+        return
+
+    election = await db.get_election(election_id)
+    if not election or str(election.get("status") or "") != "active":
+        await _safe_edit(callback, "❌ Выборы уже завершены.", _election_back_markup(election_id))
         return
 
     if int(party.get('leader_id') or 0) != leader_id:
@@ -1842,6 +1887,11 @@ async def party_invite(callback: CallbackQuery, callback_data: PartyCallback):
         )
         return
 
+    election = await db.get_election(election_id)
+    if not election or str(election.get("status") or "") != "active":
+        await _safe_edit(callback, "❌ Выборы уже завершены.", _election_back_markup(election_id))
+        return
+
     party = await db.get_party_by_leader(user_id, election_id)
     if not party:
         await _safe_edit(callback, "❌ Только лидер партии может отправлять приглашения.", _election_back_markup(election_id))
@@ -1870,6 +1920,11 @@ async def party_invite_page(callback: CallbackQuery):
         await callback.answer("❌ Партия не относится к этим выборам.", show_alert=True)
         return
 
+    election = await db.get_election(election_id)
+    if not election or str(election.get("status") or "") != "active":
+        await callback.answer("❌ Выборы уже завершены.", show_alert=True)
+        return
+
     await _render_party_invite_picker(callback, party, election_id, page=page)
 
 
@@ -1893,6 +1948,11 @@ async def party_invite_select(callback: CallbackQuery):
 
     if int(party.get("election_id") or -1) != election_id:
         await callback.answer("❌ Партия не относится к этим выборам.", show_alert=True)
+        return
+
+    election = await db.get_election(election_id)
+    if not election or str(election.get("status") or "") != "active":
+        await callback.answer("❌ Выборы уже завершены.", show_alert=True)
         return
 
     if invited_user_id == leader_id:
@@ -1956,6 +2016,15 @@ async def party_answer_invite(callback: CallbackQuery, callback_data: PartyCallb
         await _safe_edit(callback, "❌ Партия не найдена.", _election_back_markup(election_id))
         return
 
+    if int(party.get("election_id") or -1) != election_id:
+        await _safe_edit(callback, "❌ Приглашение относится к другим выборам.", _election_back_markup(election_id))
+        return
+
+    election = await db.get_election(election_id)
+    if not election or str(election.get("status") or "") != "active":
+        await _safe_edit(callback, "❌ Выборы уже завершены.", _election_back_markup(election_id))
+        return
+
     async with aiosqlite.connect(db.db_path) as conn:
         conn.row_factory = aiosqlite.Row
         cur = await conn.execute(
@@ -1972,6 +2041,15 @@ async def party_answer_invite(callback: CallbackQuery, callback_data: PartyCallb
     leader_id = int(party.get('leader_id') or 0)
 
     if decision == 1:
+        switch_note = ""
+        current_party = await db.get_user_party_for_election(user_id, election_id)
+        if current_party and int(current_party.get("id") or -1) != party_id:
+            left_ok, left_msg = await db.leave_party_for_election(user_id, election_id)
+            if not left_ok:
+                await _safe_edit(callback, left_msg, _election_back_markup(election_id))
+                return
+            switch_note = f"{left_msg}\n"
+
         success, msg = await db.add_party_member(party_id, user_id)
         if not success:
             await _safe_edit(callback, f"❌ Не удалось вступить в партию: {msg}", _election_back_markup(election_id))
@@ -1990,7 +2068,7 @@ async def party_answer_invite(callback: CallbackQuery, callback_data: PartyCallb
             except Exception:
                 pass
 
-        await _safe_edit(callback, f"✅ Вы вступили в партию '{party.get('name')}'.", _election_back_markup(election_id))
+        await _safe_edit(callback, f"{switch_note}✅ Вы вступили в партию '{party.get('name')}'.", _election_back_markup(election_id))
     else:
         async with aiosqlite.connect(db.db_path) as conn:
             await conn.execute(
