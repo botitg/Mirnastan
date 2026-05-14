@@ -5,7 +5,6 @@ handlers_part3.py - расширенные панели силовых и сер
 from __future__ import annotations
 
 import logging
-import random
 from datetime import datetime, timedelta
 
 import aiosqlite
@@ -18,6 +17,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from database import db
 from keyboards import get_back_button
 from states import OrganizationStates
+from ui_media import send_section_screen
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -130,7 +130,13 @@ async def police_menu(callback: CallbackQuery, state: FSMContext):
         ]
     )
     await state.set_state(OrganizationStates.org_menu)
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await send_section_screen(
+        callback,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+        section_key="nbr",
+    )
     await callback.answer()
 
 @router.callback_query(F.data == "police_search_suspects")
@@ -172,10 +178,12 @@ async def fbi_menu(callback: CallbackQuery, state: FSMContext):
     user = await db.get_user(user_id) or {}
     if not await _can_access_fbi(user_id, user):
         await callback.answer("Доступ только для ФБР.", show_alert=True)
-        await callback.message.edit_text(
-            "❌ Доступ только для сотрудников ФБР и руководства государства.",
+        await send_section_screen(
+            callback,
+            text="❌ Доступ только для сотрудников ФБР и руководства государства.",
             reply_markup=get_back_button(),
             parse_mode=None,
+            section_key="nbr",
         )
         return
 
@@ -214,7 +222,13 @@ async def fbi_menu(callback: CallbackQuery, state: FSMContext):
         ]
     )
     await state.set_state(OrganizationStates.org_menu)
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await send_section_screen(
+        callback,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+        section_key="nbr",
+    )
     await callback.answer()
 
 @router.callback_query(F.data == "fbi_intercept_messages")
@@ -259,7 +273,13 @@ async def fbi_statistics(callback: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="🔙 Назад", callback_data="fbi_menu")],
         ]
     )
-    await callback.message.edit_text("\n".join(lines), reply_markup=keyboard, parse_mode=None)
+    await send_section_screen(
+        callback,
+        text="\n".join(lines),
+        reply_markup=keyboard,
+        parse_mode=None,
+        section_key="nbr",
+    )
     await callback.answer()
 
 
@@ -284,7 +304,13 @@ async def fbi_operations(callback: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="🔙 Назад", callback_data="fbi_menu")],
         ]
     )
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode=None)
+    await send_section_screen(
+        callback,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode=None,
+        section_key="nbr",
+    )
     await callback.answer()
 
 
@@ -313,6 +339,9 @@ async def court_menu(callback: CallbackQuery, state: FSMContext):
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
+                    InlineKeyboardButton(text="📝 Подать иск", callback_data="fp_court_file_start"),
+                ],
+                [
                     InlineKeyboardButton(text="📂 Дела", callback_data="court_cases"),
                     InlineKeyboardButton(text="👤 Подсудимые", callback_data="court_defendants"),
                 ],
@@ -324,6 +353,7 @@ async def court_menu(callback: CallbackQuery, state: FSMContext):
     else:
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
+                [InlineKeyboardButton(text="📝 Подать иск", callback_data="fp_court_file_start")],
                 [InlineKeyboardButton(text="📂 Дела в суде", callback_data="court_cases")],
                 [InlineKeyboardButton(text="📋 Мой статус", callback_data="court_status")],
                 [InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_main")],
@@ -370,10 +400,7 @@ async def court_status(callback: CallbackQuery, state: FSMContext):
 @router.message(Command("loan"))
 @router.callback_query(F.data == "bank_menu")
 async def bank_menu(event, state: FSMContext):
-    if isinstance(event, Message):
-        message = event
-    else:
-        message = event.message
+    if not isinstance(event, Message):
         await event.answer()
 
     user = await db.get_user(event.from_user.id) or {}
@@ -393,7 +420,7 @@ async def bank_menu(event, state: FSMContext):
             ],
             [
                 InlineKeyboardButton(text="📊 История банка", callback_data="bank_history"),
-                InlineKeyboardButton(text="� История переводов", callback_data="transfer_history_menu"),
+                InlineKeyboardButton(text="🔁 История переводов", callback_data="transfer_history_menu"),
             ],
             [
                 InlineKeyboardButton(text="📄 Мои кредиты", callback_data="loan_my_status"),
@@ -414,11 +441,14 @@ async def bank_menu(event, state: FSMContext):
             ],
         ]
     )
-    await state.set_state(OrganizationStates.org_menu)
-    if isinstance(event, CallbackQuery):
-        await message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
-    else:
-        await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+    await state.clear()
+    await send_section_screen(
+        event,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+        section_key="bank",
+    )
 
 
 @router.callback_query(F.data == "loan_request")
@@ -447,7 +477,13 @@ async def loan_request_menu(callback: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="🔙 Назад", callback_data="bank_menu")],
         ]
     )
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode=None)
+    await send_section_screen(
+        callback,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode=None,
+        section_key="credit",
+    )
     await callback.answer()
 
 
@@ -478,7 +514,7 @@ async def loan_apply(callback: CallbackQuery, state: FSMContext):
     approved = credit_score >= 560 and tax_debt <= 180_000
     status = "approved" if approved else "pending"
 
-    async with aiosqlite.connect(db.db_path) as conn:
+    async with db._connect() as conn:
         conn.row_factory = aiosqlite.Row
         await conn.execute("BEGIN IMMEDIATE")
         async with conn.execute(
@@ -559,7 +595,7 @@ async def loan_apply(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "loan_my_status")
 async def loan_my_status(callback: CallbackQuery, state: FSMContext):
     rows: list[dict] = []
-    async with aiosqlite.connect(db.db_path) as conn:
+    async with db._connect() as conn:
         conn.row_factory = aiosqlite.Row
         async with conn.execute(
             """
@@ -703,13 +739,6 @@ async def transfer_history_sent(callback: CallbackQuery, state: FSMContext):
             note = str(tx.get("note") or "")
             
             total_sent += amount
-            
-            # Извлекаем ID получателя из note если возможно
-            recipient_info = ""
-            if "Кому:" in note or "Кому:" in note:
-                parts = note.split("Кому:")
-                if len(parts) > 1:
-                    recipient_info = parts[1].split(".")[0].strip()
             
             lines.append(f"💸 [{created}] ${amount:,.2f}")
             if note:
@@ -1099,7 +1128,7 @@ async def hospital_confirm_appointment(callback: CallbackQuery, state: FSMContex
 
 @router.callback_query(F.data == "hospital_history")
 async def hospital_history(callback: CallbackQuery, state: FSMContext):
-    async with aiosqlite.connect(db.db_path) as conn:
+    async with db._connect() as conn:
         conn.row_factory = aiosqlite.Row
         async with conn.execute(
             """
@@ -1136,4 +1165,5 @@ async def hospital_history(callback: CallbackQuery, state: FSMContext):
         parse_mode=None,
     )
     await callback.answer()
+
 
